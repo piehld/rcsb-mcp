@@ -38,7 +38,7 @@ src/rcsb_mcp/
                                                               — auto-generated (see scripts/)
   prompts/rcsb_search_assistant.md   served as the `rcsb_search_assistant` MCP prompt (package data)
   prompts/rcsb_mcp_guide.md          NOT served; kept as a source to rescue prose from
-tests/                       35 network-free test modules; see "Dev workflow"
+tests/                       36 network-free test modules; see "Dev workflow"
 scripts/                     generate_search_attributes.py, generate_attribute_scopes.py,
                              generate_feature_types.py
 evals/                       end-to-end accuracy suite + tool_selection A/B probe harness
@@ -217,6 +217,12 @@ After validating, add/adjust the default and re-run the suite.
   (Haiku 4.5, 0/8 -> 0/8 on the two `chem-attributes-*` probes), so don't add it back without a
   new measurement. (The one exception is the bare rcsb_id path: in the structure catalog it is
   the entry id.)
+- **A terms facet has no default size, and nested paths come back unordered.** One facet
+  can return thousands of values (source lineage names over 2,468 viral hits: 2,257 values,
+  ~40k tokens; annotation_lineage over 71,518 "kinase" hits: ~908k). `rcsb_search_request`
+  sorts terms buckets by population and, past `_FACET_VALUES_SHOWN` (100) when the spec set no
+  `max_num_intervals`, keeps the most common with a note naming the size options. The same rule
+  for every attribute: no per-attribute advice. Histogram/range buckets keep their bin order.
 - **Claude Desktop caches MCP processes.** After code changes, fully quit & relaunch
   (⌘Q) — it does not hot-reload, and stale/duplicate processes have caused confusion.
 - **The markdown docs drift, and only the cheap half is guarded.**

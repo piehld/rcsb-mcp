@@ -409,27 +409,63 @@ async def _guard_all_hits(body: dict[str, Any], offset: int = 0) -> None:
         )
 
 
-def _format_facet(facet: dict[str, Any]) -> dict[str, Any]:
-    """Normalize one facet from a search response (bucket list or single metric)."""
+# A terms facet returns every value its hits carry, and the Search API sets no default cap:
+# measured 2026-10-09, ~17-19 tokens a value --
+#     44 hits, source taxonomy_lineage.name          441 values      ~7k tokens
+#     2,468 viral hits, same attribute             2,257 values     ~40k tokens
+#     2,468 viral hits, annotation_lineage.name    3,266 values     ~61k tokens
+#     71,518 "kinase" hits, annotation_lineage.name  44,495 values  ~908k tokens
+# -- past what a client accepts from one tool call (Claude Code: 25k by default). And on
+# NESTED paths (annotation_lineage, rcsb_ec_lineage, *_feature_summary) the values come back
+# in no particular order, so the head of the list is not the most common. So every terms
+# facet is sorted by population, and one with more values than this, whose spec did not ask
+# for a number (max_num_intervals, which the API honours on nested paths too), keeps the most
+# common and says so. Histogram and range buckets keep their bin order.
+_FACET_VALUES_SHOWN = 100
+
+
+def _facet_cap_note(name: str, values: int) -> str:
+    return (f"Facet '{name}' has {values:,} values; the {_FACET_VALUES_SHOWN} most common are "
+            "shown. To choose the size, set max_num_intervals (how many values) or "
+            "min_interval_population (the smallest count kept) in the facet spec.")
+
+
+def _format_facet(facet: dict[str, Any], spec: dict[str, Any] | None = None,
+                  notes: dict[str, str] | None = None) -> dict[str, Any]:
+    """Normalize one facet from a search response (bucket list or single metric). With its
+    request `spec`, a terms facet is sorted and capped, adding to `notes` (see above)."""
     if "buckets" in facet:
+        subspecs = {s.get("name"): s for s in (spec or {}).get("facets") or []}
         buckets = []
         for b in facet.get("buckets") or []:
             bucket = {"label": b.get("label"), "population": b.get("population")}
             if b.get("facets"):  # nested sub-facets
-                bucket["facets"] = [_format_facet(f) for f in b["facets"]]
+                bucket["facets"] = [_format_facet(f, subspecs.get(f.get("name")), notes)
+                                    for f in b["facets"]]
             buckets.append(bucket)
+        if spec and spec.get("aggregation_type") == "terms":
+            buckets.sort(key=lambda b: -(b["population"] or 0))
+            if len(buckets) > _FACET_VALUES_SHOWN and spec.get("max_num_intervals") is None:
+                if notes is not None:
+                    name = facet.get("name")
+                    notes.setdefault(name, _facet_cap_note(name, len(buckets)))
+                buckets = buckets[:_FACET_VALUES_SHOWN]
         return {"name": facet.get("name"), "buckets": buckets}
     # cardinality / single-value metric facet
     return {"name": facet.get("name"), "value": facet.get("value")}
 
 
 def _format_facets(raw: dict[str, Any], body: dict[str, Any] | None = None) -> dict[str, Any]:
-    result = {
+    specs = {s.get("name"): s for s in ((body or {}).get("request_options") or {}).get("facets") or []}
+    notes: dict[str, str] = {}
+    result: dict[str, Any] = {
         "total_count": raw.get("total_count", 0),
-        "facets": [_format_facet(f) for f in raw.get("facets", [])],
+        "facets": [_format_facet(f, specs.get(f.get("name")), notes) for f in raw.get("facets", [])],
     }
     if body is not None:
         result["editor"] = _search_editor(body)
+    if notes:
+        result["notes"] = list(notes.values())
     return result
 
 
@@ -758,9 +794,10 @@ async def rcsb_search_request(
     )
     if all_hits and not facets:
         await _guard_all_hits(body, offset)
-    # The gap counts run alongside the search itself. Not for facets or groups, whose
-    # totals count something other than the hits the note would talk about.
-    counting = (None if facets or group_by
+    # The gap counts run alongside the search itself. Not for groups, whose total counts
+    # groups rather than the hits the notes talk about; a facet response's total_count is
+    # the hit count (measured: 1,546 either way), so a breakdown gets them too.
+    counting = (None if group_by
                 else asyncio.ensure_future(_side_counts(node, body)))
     try:
         raw = await _post_search(body)
@@ -787,7 +824,8 @@ async def rcsb_search_request(
     composition = queries.composition_note(node)
     total = result.get("total_count", 0)
     component = [queries.component_note(a, total, n) for a, n in wider if n > total]
-    notes = [*notes, *([composition] if composition else []), *component, *missing]
+    notes = [*notes, *([composition] if composition else []), *component, *missing,
+             *result.pop("notes", [])]
     # Thin answers from a wording-dependent query. Separate concern from the above: that one
     # is about a query being looser than it reads, this one about it being narrower.
     if not facets:
